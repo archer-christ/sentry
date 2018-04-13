@@ -1,5 +1,6 @@
 from __future__ import absolute_import
 
+import inspect
 import logging
 import threading
 from Queue import Full, PriorityQueue
@@ -78,7 +79,34 @@ class TimedFuture(Future):
             return super(TimedFuture, self).set_exception_info(*args, **kwargs)
 
 
-class ThreadedExecutor(object):
+class Executor(object):
+    Future = TimedFuture
+
+    def submit(self, callable, priority=0, block=True, timeout=None):
+        raise NotImplementedError
+
+
+class SynchronousExecutor(Executor):
+    def submit(self, callable, *args, **kwargs):
+        if args or kwargs:
+            arguments = inspect.getcallargs(Executor.submit, self, callable, *args, **kwargs)
+            for argument in ('self', 'callable'):
+                del arguments[argument]
+            logger.debug(
+                '%r does not support the following arguments that will be ignored: %r',
+                self, arguments)
+
+        future = self.Future()
+        try:
+            result = callable()
+        except Exception as error:
+            future.set_exception(error)
+        else:
+            future.set_result(result)
+        return future
+
+
+class ThreadedExecutor(Executor):
     """\
     This executor provides a method of executing callables in a threaded worker
     pool. The number of outstanding requests can be limited by the ``maxsize``
@@ -140,7 +168,7 @@ class ThreadedExecutor(object):
         if not self.__started:
             self.start()
 
-        future = TimedFuture()
+        future = self.Future()
         task = (priority, (callable, future))
         try:
             self.__queue.put(task, block=block, timeout=timeout)
