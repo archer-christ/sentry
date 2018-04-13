@@ -121,15 +121,20 @@ class ServiceDelegator(Service):
     strings which correspond to names in the backend mapping. (This list should
     contain at least one member.) The first item in the result list is
     considered the "primary backend". The remainder of the items in the result
-    list are considered "secondary backends". The result value of the primary
-    backend will be the result value of the delegated method (to callers, this
-    appears as a synchronous method call.) The secondary backends are called
-    asynchronously in the background.  (To receive the result values of these
-    method calls, provide a callback_func, described below.) If the primary
-    backend name returned by the selector function doesn't correspond to any
-    registered backend, the function will raise a ``InvalidBackend`` exception.
-    If any referenced secondary backends are not registered names, they will be
-    discarded and logged.
+    list are considered "secondary backends".
+
+    The result value of a method call to this service will be the result of the
+    same method invoked on the primary backend -- to callers, this appears as a
+    synchronous method call, regardless of whether or the executor used is able
+    to perform the request asynchronously. Requests to the secondary backends
+    are submitted independently, but are not required to complete before the
+    method returns. To receive the result values of these method calls, provide
+    a callback_func, described below.
+
+    If the primary backend name returned by the selector function doesn't
+    correspond to any registered backend, the function will raise a
+    ``InvalidBackend`` exception.  If any referenced secondary backends are not
+    registered names, they will be discarded and logged.
 
     The members and ordering of the selector function result (and thus the
     primary and secondary backends for a method call) may vary from call to
@@ -158,10 +163,11 @@ class ServiceDelegator(Service):
       exclusive access to resources. Each executor is started when the first
       task is submitted.
     - The request is added to the request queue of the primary backend using a
-      blocking put. The request is added to the request queue(s) of the
-      secondary backend(s) as a non-blocking put (if these queues are full, the
-      request is rejected and the future will raise ``Queue.Full`` when
-      attempting to retrieve the result.)
+      blocking put, ensuring that the request is handled.
+    - The request is added to the request queue(s) of the secondary backend(s)
+      as a non-blocking put. If a backend queue is full, the request will be
+      rejected and the returned future will raise ``Queue.Full`` when
+      attempting to retrieve the result.
     - The ``callback_func`` is called after all futures have completed, either
       successfully or unsuccessfully. The function parameters are:
       - the method name (as a string),
@@ -242,52 +248,36 @@ class ServiceDelegator(Service):
             if not len(selected_backend_names) > 0:
                 raise self.InvalidBackend('No backends returned by selector!')
 
-            # Ensure that the primary backend is actually registered -- we
-            # don't want to schedule any work on the secondaries if the primary
-            # request is going to fail anyway.
-            if selected_backend_names[0] not in self.__backends:
-                raise self.InvalidBackend(
-                    '{!r} is not a registered backend.'.format(
-                        selected_backend_names[0]))
-
             call_backend_method = operator.methodcaller(attribute_name, *args, **kwargs)
 
-            # Enqueue all of the secondary backend requests first since these
-            # are non-blocking queue insertions. (Since the primary backend
-            # executor queue insertion can block, if that queue was full the
-            # secondary requests would have to wait unnecessarily to be queued
-            # until the after the primary request can be enqueued.)
-            # NOTE: If the same backend is both the primary backend *and* in
-            # the secondary backend list -- this is unlikely, but possible --
-            # this means that one of the secondary requests will be queued and
-            # executed before the primary request is queued.  This is such a
-            # strange usage pattern that I don't think it's worth optimizing
-            # for.)
             results = [None] * len(selected_backend_names)
-            for i, backend_name in enumerate(selected_backend_names[1:], 1):
+            for i, backend_name in enumerate(selected_backend_names):
+                is_primary = i == 0
                 try:
                     backend, executor = self.__backends[backend_name]
                 except KeyError:
-                    logger.warning(
-                        '%r is not a registered backend and will be ignored.',
-                        backend_name,
-                        exc_info=True)
+                    if is_primary:
+                        # If the primary backend is not registered, we don't
+                        # want to schedule any work on the secondaries, so we
+                        # raise immediately.
+                        raise self.InvalidBackend(
+                            '{!r} is not a registered backend.'.format(
+                                selected_backend_names[0]))
+                    else:
+                        logger.warning(
+                            '%r is not a registered backend and will be ignored.',
+                            backend_name,
+                            exc_info=True)
                 else:
+                    # If this is the primary backend, we submit the request
+                    # with a higher priority to allow it to jump ahead of any
+                    # outstanding secondary requests. Submission is blocking to
+                    # ensure that the request is accepted.
                     results[i] = executor.submit(
                         functools.partial(call_backend_method, backend),
-                        priority=1,
-                        block=False,
+                        priority=0 if is_primary else 1,
+                        block=True if is_primary else False,
                     )
-
-            # The primary backend is scheduled last since it may block the
-            # calling thread. (We don't have to protect this from ``KeyError``
-            # since we already ensured that the primary backend exists.)
-            backend, executor = self.__backends[selected_backend_names[0]]
-            results[0] = executor.submit(
-                functools.partial(call_backend_method, backend),
-                priority=0,
-                block=True,
-            )
 
             if self.__callback_func is not None:
                 FutureSet(filter(None, results)).add_done_callback(
