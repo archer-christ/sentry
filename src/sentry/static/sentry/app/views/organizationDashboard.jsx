@@ -3,9 +3,9 @@ import React from 'react';
 import createReactClass from 'create-react-class';
 import Reflux from 'reflux';
 import {Link} from 'react-router';
-import {Flex} from 'grid-emotion';
 import {Sparklines, SparklinesLine} from 'react-sparklines';
 
+import {Flex} from '../components/grid';
 import ApiMixin from '../mixins/apiMixin';
 import {loadStats} from '../actionCreators/projects';
 
